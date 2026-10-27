@@ -1,0 +1,848 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+enum CompanyStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum UserStatus {
+  INVITED
+  ACTIVE
+  DISABLED
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  REMOVED
+}
+
+enum CompanyInvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
+
+enum SystemRole {
+  OWNER_EXECUTIVE
+  PROJECT_MANAGER
+  SITE_ENGINEER
+  PROCUREMENT
+  FINANCE
+  QUANTITY_SURVEYOR
+  STOREKEEPER
+  ADMIN
+}
+
+enum ProjectRole {
+  PROJECT_MANAGER
+  SITE_ENGINEER
+  PROCUREMENT
+  FINANCE
+  QUANTITY_SURVEYOR
+  STOREKEEPER
+  VIEWER
+}
+
+enum ProjectStatus {
+  PLANNING
+  ACTIVE
+  ON_HOLD
+  AT_RISK
+  COMPLETED
+  CLOSED
+}
+
+enum SiteStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum RecordStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum BoqVersionStatus {
+  DRAFT
+  ACTIVE
+  SUPERSEDED
+  APPROVED
+}
+
+enum BudgetStatus {
+  DRAFT
+  ACTIVE
+  SUPERSEDED
+}
+
+enum MaterialRequestStatus {
+  DRAFT
+  SUBMITTED
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  IN_PROCUREMENT
+  COMPLETED
+  CANCELLED
+}
+
+enum RequestPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum ApprovalDecision {
+  APPROVE
+  REJECT
+  RETURN
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  RETURNED
+}
+
+enum RfqStatus {
+  DRAFT
+  OPEN
+  QUOTES_RECEIVED
+  EVALUATION
+  AWARDED
+  CLOSED
+  CANCELLED
+}
+
+enum InvitationStatus {
+  INVITED
+  RESPONDED
+  DECLINED
+}
+
+enum QuoteStatus {
+  DRAFT
+  SUBMITTED
+  VALID
+  EXPIRED
+  REJECTED
+  AWARDED
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  ISSUED
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CLOSED
+  CANCELLED
+}
+
+enum GoodsReceiptStatus {
+  DRAFT
+  POSTED
+  CANCELLED
+}
+
+enum ExpenseStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  POSTED
+  CANCELLED
+}
+
+model Company {
+  id              String              @id @default(uuid()) @db.Uuid
+  name            String
+  legalName       String?
+  slug            String              @unique
+  status          CompanyStatus       @default(ACTIVE)
+  defaultCurrency String              @default("SAR")
+  timezone        String              @default("Asia/Riyadh")
+  vatNumber       String?
+  settings        Json?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+  memberships     CompanyMembership[]
+  projects        Project[]
+  sites           Site[]
+  auditEvents     AuditEvent[]
+  documents       Document[]
+  invitations     CompanyInvitation[]
+
+  @@index([status])
+}
+
+model User {
+  id                 String              @id @default(uuid()) @db.Uuid
+  name               String
+  email              String              @unique
+  passwordHash       String
+  phone              String?
+  jobTitle           String?
+  status             UserStatus          @default(ACTIVE)
+  lastLoginAt        DateTime?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  memberships        CompanyMembership[]
+  projectMemberships ProjectMember[]
+  managedProjects    Project[]           @relation("ProjectManager")
+  refreshSessions    RefreshSession[]
+  auditEvents        AuditEvent[]
+  documents          Document[]
+  sentInvitations    CompanyInvitation[] @relation("InvitationInviter")
+
+  @@index([status])
+}
+
+model CompanyMembership {
+  id        String           @id @default(uuid()) @db.Uuid
+  companyId String           @db.Uuid
+  userId    String           @db.Uuid
+  role      SystemRole
+  status    MembershipStatus @default(ACTIVE)
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+  company   Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, userId])
+  @@index([userId, status])
+  @@index([companyId, role, status])
+}
+
+model CompanyInvitation {
+  id          String                  @id @default(uuid()) @db.Uuid
+  companyId   String                  @db.Uuid
+  email       String
+  role        SystemRole
+  projectIds  String[]                @default([]) @db.Uuid
+  tokenHash   String                  @unique
+  expiresAt   DateTime
+  status      CompanyInvitationStatus @default(PENDING)
+  invitedById String                  @db.Uuid
+  acceptedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime                @default(now())
+  updatedAt   DateTime                @updatedAt
+  company     Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invitedBy   User                    @relation("InvitationInviter", fields: [invitedById], references: [id], onDelete: Restrict)
+
+  @@index([companyId, email, status])
+  @@index([tokenHash, status, expiresAt])
+}
+
+model Role {
+  id          String     @id @default(uuid()) @db.Uuid
+  key         SystemRole @unique
+  label       String
+  permissions String[]
+}
+
+model Project {
+  id                String          @id @default(uuid()) @db.Uuid
+  companyId         String          @db.Uuid
+  code              String
+  name              String
+  clientName        String?
+  location          String?
+  status            ProjectStatus    @default(PLANNING)
+  contractValue     Decimal?         @db.Decimal(18, 2)
+  budgetValue       Decimal?         @db.Decimal(18, 2)
+  startDate         DateTime?
+  plannedEndDate    DateTime?
+  actualEndDate     DateTime?
+  projectManagerId  String?          @db.Uuid
+  progressPercent   Decimal          @default(0) @db.Decimal(5, 2)
+  description       String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  company           Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  projectManager    User?           @relation("ProjectManager", fields: [projectManagerId], references: [id], onDelete: SetNull)
+  members           ProjectMember[]
+  sites             Site[]
+  documents         Document[]
+
+  @@unique([companyId, code])
+  @@index([companyId, status])
+  @@index([companyId, name])
+  @@index([projectManagerId])
+}
+
+model ProjectMember {
+  id        String      @id @default(uuid()) @db.Uuid
+  projectId String      @db.Uuid
+  userId    String      @db.Uuid
+  role      ProjectRole
+  createdAt DateTime    @default(now())
+  project   Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId, role])
+}
+
+model Site {
+  id        String     @id @default(uuid()) @db.Uuid
+  companyId String     @db.Uuid
+  projectId String     @db.Uuid
+  name      String
+  code      String
+  location  String?
+  status    SiteStatus @default(ACTIVE)
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, code])
+  @@index([companyId, projectId, status])
+}
+
+model RefreshSession {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @db.Uuid
+  tokenHash String   @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+}
+
+model AuditEvent {
+  id         String   @id @default(uuid()) @db.Uuid
+  companyId  String   @db.Uuid
+  actorId    String?  @db.Uuid
+  action     String
+  entityType String
+  entityId   String?
+  metadata   Json?
+  createdAt  DateTime @default(now())
+  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  actor      User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, createdAt])
+  @@index([entityType, entityId])
+}
+
+model Document {
+  id          String   @id @default(uuid()) @db.Uuid
+  companyId   String   @db.Uuid
+  projectId   String?  @db.Uuid
+  uploadedBy  String   @db.Uuid
+  name        String
+  originalName String?
+  mimeType    String
+  size        Int?
+  storageKey  String
+  entityType  String?
+  entityId    String?
+  version     Int              @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project     Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  uploader    User     @relation(fields: [uploadedBy], references: [id], onDelete: Restrict)
+  versions    DocumentVersion[]
+
+  @@index([companyId, projectId])
+}
+
+model DocumentVersion {
+  id          String   @id @default(uuid()) @db.Uuid
+  documentId  String   @db.Uuid
+  version     Int
+  name        String
+  mimeType    String
+  size        Int?
+  storageKey  String
+  uploadedBy  String   @db.Uuid
+  createdAt   DateTime @default(now())
+  document    Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  @@unique([documentId, version])
+  @@index([documentId, createdAt])
+}
+
+model Boq {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  name String @default("Main BOQ")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([projectId, name])
+  @@index([companyId, projectId])
+}
+
+model BoqVersion {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  boqId String @db.Uuid
+  version Int
+  status BoqVersionStatus @default(DRAFT)
+  effectiveAt DateTime?
+  createdById String @db.Uuid
+  approvedById String? @db.Uuid
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([boqId, version])
+  @@index([companyId, projectId, status])
+}
+
+model BoqItem {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  boqVersionId String @db.Uuid
+  code String
+  description String
+  unit String
+  contractQuantity Decimal @db.Decimal(18, 4)
+  contractRate Decimal @db.Decimal(18, 4)
+  contractValue Decimal @db.Decimal(18, 2)
+  executedQuantity Decimal @default(0) @db.Decimal(18, 4)
+  progressPercent Decimal @default(0) @db.Decimal(5, 2)
+  costCodeId String? @db.Uuid
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([boqVersionId, code])
+  @@index([companyId, projectId, code])
+}
+
+model CostCode {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String? @db.Uuid
+  parentId String? @db.Uuid
+  code String
+  name String
+  description String?
+  category String?
+  status RecordStatus @default(ACTIVE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([companyId, projectId, code])
+  @@index([companyId, projectId, status])
+}
+
+model Budget {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  name String
+  version Int @default(1)
+  status BudgetStatus @default(DRAFT)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([projectId, version])
+  @@index([companyId, projectId, status])
+}
+
+model BudgetLine {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  budgetId String @db.Uuid
+  costCodeId String @db.Uuid
+  original Decimal @db.Decimal(18, 2)
+  revised Decimal @db.Decimal(18, 2)
+  committed Decimal @default(0) @db.Decimal(18, 2)
+  actual Decimal @default(0) @db.Decimal(18, 2)
+  forecast Decimal @default(0) @db.Decimal(18, 2)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([budgetId, costCodeId])
+  @@index([companyId, projectId])
+}
+
+model Supplier {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  code String
+  name String
+  legalName String?
+  contactPerson String?
+  email String?
+  phone String?
+  taxNumber String?
+  city String?
+  country String?
+  category String?
+  status RecordStatus @default(ACTIVE)
+  rating Decimal? @db.Decimal(3, 2)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([companyId, code])
+  @@index([companyId, status, category])
+  @@index([companyId, name])
+}
+
+model MaterialRequest {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  siteId String? @db.Uuid
+  requestNumber String
+  requestedById String @db.Uuid
+  requestedForDate DateTime?
+  priority RequestPriority @default(NORMAL)
+  status MaterialRequestStatus @default(DRAFT)
+  purpose String?
+  notes String?
+  submittedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([companyId, requestNumber])
+  @@index([companyId, projectId, status])
+}
+
+model MaterialRequestItem {
+  id String @id @default(uuid()) @db.Uuid
+  materialRequestId String @db.Uuid
+  description String
+  specification String?
+  unit String
+  requestedQuantity Decimal @db.Decimal(18, 4)
+  costCodeId String? @db.Uuid
+  boqItemId String? @db.Uuid
+  notes String?
+  @@index([materialRequestId])
+}
+
+model ApprovalWorkflow {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  name String
+  entityType String
+  createdAt DateTime @default(now())
+  @@unique([companyId, entityType, name])
+}
+
+model ApprovalStep {
+  id String @id @default(uuid()) @db.Uuid
+  workflowId String @db.Uuid
+  stepNumber Int
+  role SystemRole
+  name String
+  @@unique([workflowId, stepNumber])
+}
+
+model ApprovalInstance {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String? @db.Uuid
+  entityType String
+  entityId String @db.Uuid
+  workflowId String @db.Uuid
+  currentStepId String?
+  status ApprovalStatus @default(PENDING)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@index([companyId, status])
+  @@index([entityType, entityId])
+}
+
+model ApprovalAction {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String? @db.Uuid
+  instanceId String @db.Uuid
+  stepId String @db.Uuid
+  actorId String @db.Uuid
+  actorRole SystemRole
+  decision ApprovalDecision
+  comment String?
+  createdAt DateTime @default(now())
+  @@index([companyId, instanceId, createdAt])
+}
+
+model Rfq {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  rfqNumber String
+  sourceMaterialRequestId String? @db.Uuid
+  title String
+  description String?
+  issueDate DateTime?
+  closingDate DateTime?
+  status RfqStatus @default(DRAFT)
+  createdById String @db.Uuid
+  awardedSupplierId String? @db.Uuid
+  awardedQuoteId String? @db.Uuid
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([companyId, rfqNumber])
+  @@index([companyId, projectId, status])
+}
+
+model RfqItem {
+  id String @id @default(uuid()) @db.Uuid
+  rfqId String @db.Uuid
+  materialRequestItemId String? @db.Uuid
+  description String
+  specification String?
+  unit String
+  quantity Decimal @db.Decimal(18, 4)
+  boqItemId String? @db.Uuid
+  costCodeId String? @db.Uuid
+  createdAt DateTime @default(now())
+  @@index([rfqId])
+}
+
+model RfqSupplier {
+  id String @id @default(uuid()) @db.Uuid
+  rfqId String @db.Uuid
+  supplierId String @db.Uuid
+  invitationStatus InvitationStatus @default(INVITED)
+  invitedAt DateTime @default(now())
+  respondedAt DateTime?
+  @@unique([rfqId, supplierId])
+  @@index([supplierId])
+}
+
+model SupplierQuote {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  rfqId String @db.Uuid
+  supplierId String @db.Uuid
+  quoteNumber String
+  quoteDate DateTime
+  validUntil DateTime?
+  currency String @default("SAR")
+  subtotal Decimal @db.Decimal(18, 2)
+  taxAmount Decimal @default(0) @db.Decimal(18, 2)
+  totalAmount Decimal @db.Decimal(18, 2)
+  deliveryDays Int?
+  paymentTerms String?
+  notes String?
+  status QuoteStatus @default(DRAFT)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([companyId, quoteNumber])
+  @@index([companyId, rfqId, status])
+}
+
+model SupplierQuoteItem {
+  id String @id @default(uuid()) @db.Uuid
+  supplierQuoteId String @db.Uuid
+  rfqItemId String @db.Uuid
+  quantity Decimal @db.Decimal(18, 4)
+  unitRate Decimal @db.Decimal(18, 4)
+  lineTotal Decimal @db.Decimal(18, 2)
+  notes String?
+  @@unique([supplierQuoteId, rfqItemId])
+}
+
+model PurchaseOrder {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  poNumber String
+  supplierId String @db.Uuid
+  sourceRfqId String? @db.Uuid
+  sourceQuoteId String? @db.Uuid
+  status PurchaseOrderStatus @default(DRAFT)
+  currency String @default("SAR")
+  subtotal Decimal @db.Decimal(18, 2)
+  taxAmount Decimal @default(0) @db.Decimal(18, 2)
+  totalAmount Decimal @db.Decimal(18, 2)
+  orderDate DateTime @default(now())
+  expectedDeliveryDate DateTime?
+  paymentTerms String?
+  deliveryTerms String?
+  createdById String @db.Uuid
+  approvedAt DateTime?
+  issuedAt DateTime?
+  closedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([companyId, poNumber])
+  @@index([companyId, projectId, status])
+}
+
+model PurchaseOrderItem {
+  id String @id @default(uuid()) @db.Uuid
+  purchaseOrderId String @db.Uuid
+  description String
+  unit String
+  quantity Decimal @db.Decimal(18, 4)
+  unitRate Decimal @db.Decimal(18, 4)
+  lineTotal Decimal @db.Decimal(18, 2)
+  costCodeId String? @db.Uuid
+  boqItemId String? @db.Uuid
+  orderedQuantity Decimal @db.Decimal(18, 4)
+  receivedQuantity Decimal @default(0) @db.Decimal(18, 4)
+  @@index([purchaseOrderId])
+}
+
+model GoodsReceipt {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  siteId String? @db.Uuid
+  purchaseOrderId String @db.Uuid
+  receiptNumber String
+  supplierId String @db.Uuid
+  receivedDate DateTime @default(now())
+  receivedById String @db.Uuid
+  status GoodsReceiptStatus @default(DRAFT)
+  deliveryNoteNumber String?
+  notes String?
+  createdAt DateTime @default(now())
+  @@unique([companyId, receiptNumber])
+  @@index([companyId, projectId, status])
+}
+
+model GoodsReceiptItem {
+  id String @id @default(uuid()) @db.Uuid
+  goodsReceiptId String @db.Uuid
+  purchaseOrderItemId String @db.Uuid
+  receivedQuantity Decimal @db.Decimal(18, 4)
+  acceptedQuantity Decimal @db.Decimal(18, 4)
+  rejectedQuantity Decimal @db.Decimal(18, 4)
+  notes String?
+}
+
+model Expense {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  projectId String @db.Uuid
+  siteId String? @db.Uuid
+  expenseNumber String
+  costCodeId String?
+  category String
+  description String
+  amount Decimal @db.Decimal(18, 2)
+  taxAmount Decimal @default(0) @db.Decimal(18, 2)
+  expenseDate DateTime
+  payee String?
+  createdById String @db.Uuid
+  status ExpenseStatus @default(DRAFT)
+  attachmentRef String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([companyId, expenseNumber])
+  @@index([companyId, projectId, status])
+}
+
+model Subcontractor {
+  id String @id @default(uuid()) @db.Uuid
+  companyId String @db.Uuid
+  code String
+  name String
+  contactPerson String?
+  phone String?
+  email String?
+  specialties String?
+  status RecordStatus @default(ACTIVE)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  @@unique([companyId, code])
+  @@index([companyId, status])
+}
+
+enum SubcontractStatus {
+  DRAFT
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  CLOSED
+  CANCELLED
+}
+
+model Subcontract {
+  id                  String            @id @default(uuid()) @db.Uuid
+  companyId           String            @db.Uuid
+  projectId           String            @db.Uuid
+  subcontractorId     String            @db.Uuid
+  contractNumber      String
+  scope               String
+  contractAmount      Decimal           @db.Decimal(18, 2)
+  startDate           DateTime?
+  endDate             DateTime?
+  retentionPercentage Decimal           @default(0) @db.Decimal(5, 2)
+  paymentTerms        String?
+  status              SubcontractStatus @default(DRAFT)
+  createdById         String            @db.Uuid
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+  @@unique([companyId, contractNumber])
+  @@index([companyId, projectId, status])
+}
+
+model SubcontractProgress {
+  id             String   @id @default(uuid()) @db.Uuid
+  companyId      String   @db.Uuid
+  projectId      String   @db.Uuid
+  subcontractId  String   @db.Uuid
+  progressPercent Decimal  @db.Decimal(5, 2)
+  completedValue Decimal  @default(0) @db.Decimal(18, 2)
+  certifiedValue Decimal  @default(0) @db.Decimal(18, 2)
+  retentionValue Decimal  @default(0) @db.Decimal(18, 2)
+  paymentDue     Decimal  @default(0) @db.Decimal(18, 2)
+  notes          String?
+  updateDate     DateTime @default(now())
+  createdById    String   @db.Uuid
+  createdAt      DateTime @default(now())
+  @@index([companyId, projectId, subcontractId, updateDate])
+}
+
+model ProgressUpdate {
+  id               String   @id @default(uuid()) @db.Uuid
+  companyId        String   @db.Uuid
+  projectId        String   @db.Uuid
+  siteId           String?  @db.Uuid
+  boqItemId        String?  @db.Uuid
+  measuredQuantity Decimal? @db.Decimal(18, 4)
+  progressPercent  Decimal  @db.Decimal(5, 2)
+  measuredDate     DateTime @default(now())
+  notes            String?
+  createdById      String   @db.Uuid
+  createdAt        DateTime @default(now())
+  @@index([companyId, projectId, measuredDate])
+  @@index([boqItemId, measuredDate])
+}
+
+enum NotificationType {
+  APPROVAL_ASSIGNED
+  STATUS_CHANGED
+  PROJECT_ASSIGNMENT
+  SYSTEM
+}
+
+model Notification {
+  id         String           @id @default(uuid()) @db.Uuid
+  companyId  String           @db.Uuid
+  userId     String           @db.Uuid
+  type       NotificationType
+  title      String
+  message    String
+  entityType String?
+  entityId   String?
+  readAt     DateTime?
+  createdAt  DateTime         @default(now())
+  @@index([companyId, userId, readAt, createdAt])
+}

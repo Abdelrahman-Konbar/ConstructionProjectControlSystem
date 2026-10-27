@@ -1,0 +1,10 @@
+packages:
+  - apps/*
+
+# Development commands must never repair or mutate node_modules implicitly.
+verifyDepsBeforeRun: false
+
+# Disable minimum-release-age checks for local development.
+# This prevents legitimate freshly-published transitive packages
+# (such as Rollup platform binaries) from blocking installation.
+minimumReleaseAge: 0

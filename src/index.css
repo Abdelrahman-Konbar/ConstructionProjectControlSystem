@@ -1,0 +1,21 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+@theme {
+  --color-ink: #0f1b2d; --color-navy: #16263d; --color-slate2: #23364f;
+  --color-sand: #f5f1ea; --color-paper: #fbf9f5; --color-line: #e3ddd2;
+  --color-steel: #6b7686; --color-amber: #d9701e; --color-amber2: #f3a54a;
+  --font-sans: "IBM Plex Sans Arabic", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", monospace;
+}
+body { background: var(--color-sand); color: var(--color-ink); font-family: var(--font-sans); }
+.blueprint { background-image: linear-gradient(rgba(255,255,255,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.05) 1px, transparent 1px); background-size: 24px 24px; }
+.grid-paper { background-image: linear-gradient(rgba(15,27,45,.035) 1px, transparent 1px), linear-gradient(90deg, rgba(15,27,45,.035) 1px, transparent 1px); background-size: 32px 32px; }
+.card { background: var(--color-paper); border: 1px solid var(--color-line); border-radius: 10px; position: relative; }
+.corner::before, .corner::after { content: ""; position: absolute; width: 10px; height: 10px; border-color: var(--color-amber); }
+.corner::before { top: -1px; inset-inline-start: -1px; border-top: 2px solid; border-inline-start: 2px solid; border-start-start-radius: 10px; }
+.corner::after { bottom: -1px; inset-inline-end: -1px; border-bottom: 2px solid; border-inline-end: 2px solid; border-end-end-radius: 10px; }
+.num { font-family: var(--font-mono); font-feature-settings: "tnum"; }
+table.dt { width: 100%; font-size: 13px; }
+table.dt th { text-align: start; font-weight: 500; color: var(--color-steel); font-size: 11.5px; padding: 10px 14px; border-bottom: 1px solid var(--color-line); background: #f1ece3; }
+table.dt td { padding: 11px 14px; border-bottom: 1px solid #eee8de; }
+table.dt tr:hover td { background: #f7f3ec; }

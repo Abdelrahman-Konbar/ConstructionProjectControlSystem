@@ -1,0 +1,134 @@
+import { ConflictException, ForbiddenException, Injectable, NotFoundException } from '@nestjs/common'
+import { ApprovalDecision, ApprovalStatus, MaterialRequestStatus, Prisma, SystemRole } from '@prisma/client'
+import { PrismaService } from '../prisma/prisma.service'
+import { AuditService } from '../common/audit.service'
+import type { AuthenticatedUser } from '../common/auth.types'
+import type { BoqItemDto, BudgetDto, CostCodeDto, DecisionDto, ListDto, MaterialRequestDto, SupplierDto } from './dto'
+
+const companyWide = ['OWNER_EXECUTIVE', 'ADMIN'] as SystemRole[]
+@Injectable()
+export class CoreService {
+  constructor(private readonly prisma: PrismaService, private readonly audit: AuditService) {}
+  private async project(user: AuthenticatedUser, projectId: string) { const p = await this.prisma.project.findFirst({ where: { id: projectId, companyId: user.companyId, ...(companyWide.includes(user.role) ? {} : { members: { some: { userId: user.id } } }) } }); if (!p) throw new NotFoundException('Project not found'); return p }
+  private allow(user: AuthenticatedUser, roles: SystemRole[]) { if (!roles.includes(user.role)) throw new ForbiddenException('Operation is not permitted for this role') }
+  private decimal(value: number) { return new Prisma.Decimal(value) }
+  private serialize(value: any): any { if (!value || typeof value !== 'object') return value; if (value instanceof Prisma.Decimal) return value.toString(); if (value instanceof Date) return value.toISOString(); if (Array.isArray(value)) return value.map((v) => this.serialize(v)); return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, this.serialize(v)])) }
+
+  async dashboard(user: AuthenticatedUser) {
+    const projectIds = companyWide.includes(user.role)
+      ? (await this.prisma.project.findMany({ where: { companyId: user.companyId }, select: { id: true } })).map((p) => p.id)
+      : (await this.prisma.projectMember.findMany({ where: { userId: user.id }, select: { projectId: true } })).map((p) => p.projectId)
+    const scope = { companyId: user.companyId, projectId: { in: projectIds } }
+    const [rfqCount, openRfqCount, poCount, pendingReceipts, postedExpenses, pendingExpenseApprovals, materialRequests, pendingApprovals, budgets] = await Promise.all([
+      this.prisma.rfq.count({ where: scope }),
+      this.prisma.rfq.count({ where: { ...scope, status: { in: ['DRAFT', 'OPEN', 'QUOTES_RECEIVED', 'EVALUATION'] } } }),
+      this.prisma.purchaseOrder.count({ where: scope }),
+      this.prisma.purchaseOrder.count({ where: { ...scope, status: { in: ['ISSUED', 'PARTIALLY_RECEIVED'] } } }),
+      this.prisma.expense.count({ where: { ...scope, status: 'POSTED' } }),
+      this.prisma.approvalInstance.count({ where: { ...scope, entityType: 'Expense', status: 'PENDING' } }),
+      this.prisma.materialRequest.count({ where: scope }),
+      this.prisma.approvalInstance.count({ where: { ...scope, status: 'PENDING' } }),
+      this.prisma.budgetLine.findMany({ where: scope, select: { revised: true } }),
+    ])
+    const purchaseOrders = await this.prisma.purchaseOrder.findMany({ where: { ...scope, status: { in: ['APPROVED', 'ISSUED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CLOSED'] } }, select: { id: true, orderDate: true } })
+    const poItems = purchaseOrders.length ? await this.prisma.purchaseOrderItem.findMany({ where: { purchaseOrderId: { in: purchaseOrders.map((p) => p.id) } }, select: { lineTotal: true, unitRate: true, id: true, purchaseOrderId: true } }) : []
+    const receipts = await this.prisma.goodsReceipt.findMany({ where: { ...scope, status: 'POSTED' }, select: { id: true, receivedDate: true } })
+    const receiptItems = receipts.length ? await this.prisma.goodsReceiptItem.findMany({ where: { goodsReceiptId: { in: receipts.map((r) => r.id) } }, select: { goodsReceiptId: true, purchaseOrderItemId: true, acceptedQuantity: true } }) : []
+    const expenses = await this.prisma.expense.findMany({ where: { ...scope, status: 'POSTED' }, select: { amount: true, taxAmount: true, expenseDate: true } })
+    const committed = poItems.reduce((sum, item) => sum + Number(item.lineTotal), 0)
+    const actual = receiptItems.reduce((sum, receipt) => sum + Number(receipt.acceptedQuantity) * Number(poItems.find((item) => item.id === receipt.purchaseOrderItemId)?.unitRate ?? 0), 0) + expenses.reduce((sum, expense) => sum + Number(expense.amount) + Number(expense.taxAmount), 0)
+    const monthKey = (date: Date) => `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`
+    const history = new Map<string, { planned: number; actual: number }>()
+    const cursor = new Date()
+    cursor.setUTCDate(1)
+    cursor.setUTCHours(0, 0, 0, 0)
+    for (let index = 11; index >= 0; index--) {
+      const month = new Date(cursor)
+      month.setUTCMonth(cursor.getUTCMonth() - index)
+      history.set(monthKey(month), { planned: 0, actual: 0 })
+    }
+    const addHistory = (date: Date, field: 'planned' | 'actual', value: number) => {
+      const key = monthKey(date)
+      const point = history.get(key)
+      if (point) point[field] += value
+    }
+    for (const purchaseOrder of purchaseOrders) {
+      const itemsForOrder = poItems.filter((item) => purchaseOrder.id === item.purchaseOrderId)
+      if (itemsForOrder.length) for (const item of itemsForOrder) addHistory(purchaseOrder.orderDate, 'planned', Number(item.lineTotal))
+    }
+    for (const receipt of receipts) {
+      for (const item of receiptItems.filter((entry) => entry.goodsReceiptId === receipt.id)) {
+        const poItem = poItems.find((entry) => entry.id === item.purchaseOrderItemId)
+        if (poItem) addHistory(receipt.receivedDate, 'actual', Number(item.acceptedQuantity) * Number(poItem.unitRate))
+      }
+    }
+    for (const expense of expenses) addHistory(expense.expenseDate, 'actual', Number(expense.amount) + Number(expense.taxAmount))
+    return { rfqCount, openRfqCount, poCount, pendingReceipts, postedExpenses, pendingExpenseApprovals, materialRequests, pendingApprovals, budgetTotal: budgets.reduce((sum, line) => sum + Number(line.revised), 0), committed, actual, history: Array.from(history, ([period, values]) => ({ period, ...values })).filter((point) => point.planned > 0 || point.actual > 0) }
+  }
+
+  async boq(user: AuthenticatedUser, projectId: string, q: ListDto) { await this.project(user, projectId); const version = await this.prisma.boqVersion.findFirst({ where: { companyId: user.companyId, projectId, status: { in: ['ACTIVE', 'APPROVED', 'DRAFT'] } }, orderBy: { version: 'desc' } }); const items = version ? await this.prisma.boqItem.findMany({ where: { companyId: user.companyId, projectId, boqVersionId: version.id, ...(q.search ? { OR: [{ code: { contains: q.search, mode: 'insensitive' } }, { description: { contains: q.search, mode: 'insensitive' } }] } : {}) }, orderBy: { code: 'asc' }, skip: (q.page - 1) * q.limit, take: q.limit }) : []; return this.serialize({ version, items }) }
+  async createBoq(user: AuthenticatedUser, projectId: string, dto: BoqItemDto) { await this.project(user, projectId); this.allow(user, [SystemRole.OWNER_EXECUTIVE, SystemRole.ADMIN, SystemRole.QUANTITY_SURVEYOR, SystemRole.PROJECT_MANAGER]); let boq = await this.prisma.boq.findFirst({ where: { companyId: user.companyId, projectId } }); if (!boq) boq = await this.prisma.boq.create({ data: { companyId: user.companyId, projectId } }); let version = await this.prisma.boqVersion.findFirst({ where: { boqId: boq.id, status: { in: ['ACTIVE', 'APPROVED', 'DRAFT'] } }, orderBy: { version: 'desc' } }); if (!version) version = await this.prisma.boqVersion.create({ data: { companyId: user.companyId, projectId, boqId: boq.id, version: 1, status: 'ACTIVE', createdById: user.id } }); const item = await this.prisma.boqItem.create({ data: { companyId: user.companyId, projectId, boqVersionId: version.id, code: dto.code, description: dto.description, unit: dto.unit, contractQuantity: this.decimal(dto.contractQuantity), contractRate: this.decimal(dto.contractRate), contractValue: this.decimal(dto.contractQuantity * dto.contractRate), costCodeId: dto.costCodeId } }); await this.audit.record({ companyId: user.companyId, actorId: user.id, action: 'BOQ_ITEM_CREATED', entityType: 'BoqItem', entityId: item.id }); return this.serialize(item) }
+  async updateBoq(user: AuthenticatedUser, id: string, dto: BoqItemDto) { const item = await this.prisma.boqItem.findFirst({ where: { id, companyId: user.companyId } }); if (!item) throw new NotFoundException('BOQ item not found'); await this.project(user, item.projectId); this.allow(user, [SystemRole.OWNER_EXECUTIVE, SystemRole.ADMIN, SystemRole.QUANTITY_SURVEYOR, SystemRole.PROJECT_MANAGER]); const updated = await this.prisma.boqItem.update({ where: { id }, data: { code: dto.code, description: dto.description, unit: dto.unit, contractQuantity: this.decimal(dto.contractQuantity), contractRate: this.decimal(dto.contractRate), contractValue: this.decimal(dto.contractQuantity * dto.contractRate), costCodeId: dto.costCodeId } }); await this.audit.record({ companyId: user.companyId, actorId: user.id, action: 'BOQ_ITEM_UPDATED', entityType: 'BoqItem', entityId: id }); return this.serialize(updated) }
+
+  async costCodes(user: AuthenticatedUser, projectId: string, q: ListDto) { await this.project(user, projectId); return this.serialize(await this.prisma.costCode.findMany({ where: { companyId: user.companyId, projectId, ...(q.search ? { OR: [{ code: { contains: q.search, mode: 'insensitive' } }, { name: { contains: q.search, mode: 'insensitive' } }] } : {}) }, orderBy: { code: 'asc' } })) }
+  async createCostCode(user: AuthenticatedUser, projectId: string, dto: CostCodeDto) { await this.project(user, projectId); this.allow(user, [SystemRole.OWNER_EXECUTIVE, SystemRole.ADMIN, SystemRole.QUANTITY_SURVEYOR, SystemRole.FINANCE]); const code = await this.prisma.costCode.create({ data: { companyId: user.companyId, projectId, code: dto.code, name: dto.name, description: dto.description, category: dto.category, parentId: dto.parentId, status: dto.status } }); await this.audit.record({ companyId: user.companyId, actorId: user.id, action: 'COST_CODE_CREATED', entityType: 'CostCode', entityId: code.id }); return code }
+  async updateCostCode(user: AuthenticatedUser, id: string, dto: CostCodeDto) { const code = await this.prisma.costCode.findFirst({ where: { id, companyId: user.companyId } }); if (!code) throw new NotFoundException('Cost code not found'); if (!companyWide.includes(user.role) && !['QUANTITY_SURVEYOR', 'FINANCE'].includes(user.role)) throw new ForbiddenException('Cost code update is not permitted'); return this.prisma.costCode.update({ where: { id }, data: { code: dto.code, name: dto.name, description: dto.description, category: dto.category, parentId: dto.parentId, status: dto.status } }) }
+
+  async budget(user: AuthenticatedUser, projectId: string) { await this.project(user, projectId); const budget = await this.prisma.budget.findFirst({ where: { companyId: user.companyId, projectId }, orderBy: { version: 'desc' } }); const lines = budget ? await this.prisma.budgetLine.findMany({ where: { companyId: user.companyId, projectId, budgetId: budget.id } }) : []; const purchaseOrders = await this.prisma.purchaseOrder.findMany({ where: { companyId: user.companyId, projectId, status: { in: ['APPROVED', 'ISSUED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'CLOSED'] } } }); const poItems = purchaseOrders.length ? await this.prisma.purchaseOrderItem.findMany({ where: { purchaseOrderId: { in: purchaseOrders.map((p) => p.id) } } }) : []; const receipts = await this.prisma.goodsReceipt.findMany({ where: { companyId: user.companyId, projectId, status: 'POSTED' } }); const receiptItems = receipts.length ? await this.prisma.goodsReceiptItem.findMany({ where: { goodsReceiptId: { in: receipts.map((r) => r.id) } } }) : []; const expenses = await this.prisma.expense.findMany({ where: { companyId: user.companyId, projectId, status: 'POSTED' } }); const actualByCode = new Map<string, number>(); for (const receipt of receiptItems) { const item = poItems.find((x) => x.id === receipt.purchaseOrderItemId); if (item?.costCodeId) actualByCode.set(item.costCodeId, (actualByCode.get(item.costCodeId) ?? 0) + Number(receipt.acceptedQuantity) * Number(item.unitRate)) } for (const expense of expenses) if (expense.costCodeId) actualByCode.set(expense.costCodeId, (actualByCode.get(expense.costCodeId) ?? 0) + Number(expense.amount) + Number(expense.taxAmount)); const committedByCode = new Map<string, number>(); for (const item of poItems) if (item.costCodeId) committedByCode.set(item.costCodeId, (committedByCode.get(item.costCodeId) ?? 0) + Number(item.lineTotal)); const computedLines = lines.map((line) => { const committed = committedByCode.get(line.costCodeId) ?? 0; const actual = actualByCode.get(line.costCodeId) ?? 0; const revised = Number(line.revised); const forecast = Math.max(committed, actual); return { ...line, committed, actual, forecast, remaining: revised - actual, variance: revised - forecast } }); return this.serialize({ budget, lines: computedLines, summary: { original: computedLines.reduce((n, l) => n + Number(l.original), 0), revised: computedLines.reduce((n, l) => n + Number(l.revised), 0), committed: computedLines.reduce((n, l) => n + Number(l.committed), 0), actual: computedLines.reduce((n, l) => n + Number(l.actual), 0), forecast: computedLines.reduce((n, l) => n + Number(l.forecast), 0), variance: computedLines.reduce((n, l) => n + Number(l.variance), 0) } }) }
+  async createBudget(user: AuthenticatedUser, projectId: string, dto: BudgetDto) { await this.project(user, projectId); if (!['OWNER_EXECUTIVE', 'ADMIN', 'QUANTITY_SURVEYOR', 'FINANCE'].includes(user.role)) throw new ForbiddenException('Budget changes are not permitted'); const budget = await this.prisma.budget.create({ data: { companyId: user.companyId, projectId, name: dto.name, version: 1, status: 'ACTIVE' } }); for (const line of dto.lines) await this.prisma.budgetLine.create({ data: { companyId: user.companyId, projectId, budgetId: budget.id, costCodeId: line.costCodeId, original: this.decimal(line.original), revised: this.decimal(line.revised), forecast: this.decimal(line.revised) } }); await this.audit.record({ companyId: user.companyId, actorId: user.id, action: 'BUDGET_CREATED', entityType: 'Budget', entityId: budget.id }); return this.budget(user, projectId) }
+  async reviseBudget(user: AuthenticatedUser, projectId: string, dto: BudgetDto) { await this.project(user, projectId); this.allow(user, [SystemRole.OWNER_EXECUTIVE, SystemRole.ADMIN, SystemRole.QUANTITY_SURVEYOR, SystemRole.FINANCE]); if (!dto.lines.length) throw new ConflictException('A budget revision requires at least one line'); await this.prisma.$transaction(async (tx) => { const current = await tx.budget.findFirst({ where: { companyId: user.companyId, projectId }, orderBy: { version: 'desc' } }); const nextVersion = (current?.version ?? 0) + 1; if (current) await tx.budget.update({ where: { id: current.id }, data: { status: 'SUPERSEDED' } }); const revision = await tx.budget.create({ data: { companyId: user.companyId, projectId, name: dto.name, version: nextVersion, status: 'ACTIVE' } }); await tx.budgetLine.createMany({ data: dto.lines.map((line) => ({ companyId: user.companyId, projectId, budgetId: revision.id, costCodeId: line.costCodeId, original: this.decimal(line.original), revised: this.decimal(line.revised), forecast: this.decimal(line.revised) })) }); await tx.auditEvent.create({ data: { companyId: user.companyId, actorId: user.id, action: 'BUDGET_REVISED', entityType: 'Budget', entityId: revision.id, metadata: { version: nextVersion, replacesBudgetId: current?.id } } }) }); return this.budget(user, projectId) }
+
+  async suppliers(user: AuthenticatedUser, q: ListDto) { const where: Prisma.SupplierWhereInput = { companyId: user.companyId, ...(q.search ? { OR: [{ code: { contains: q.search, mode: 'insensitive' } }, { name: { contains: q.search, mode: 'insensitive' } }] } : {}), ...(q.status ? { status: q.status as any } : {}), ...(q.category ? { category: q.category } : {}) }; const [items, total] = await this.prisma.$transaction([this.prisma.supplier.findMany({ where, orderBy: { name: 'asc' }, skip: (q.page - 1) * q.limit, take: q.limit }), this.prisma.supplier.count({ where })]); return this.serialize({ items, total, page: q.page, limit: q.limit }) }
+  async supplier(user: AuthenticatedUser, id: string) { const item = await this.prisma.supplier.findFirst({ where: { id, companyId: user.companyId } }); if (!item) throw new NotFoundException('Supplier not found'); return this.serialize(item) }
+  async createSupplier(user: AuthenticatedUser, dto: SupplierDto) { this.allow(user, [SystemRole.OWNER_EXECUTIVE, SystemRole.ADMIN, SystemRole.PROCUREMENT]); const item = await this.prisma.supplier.create({ data: { companyId: user.companyId, ...dto, rating: dto.rating === undefined ? undefined : this.decimal(dto.rating) } }); await this.audit.record({ companyId: user.companyId, actorId: user.id, action: 'SUPPLIER_CREATED', entityType: 'Supplier', entityId: item.id }); return this.serialize(item) }
+  async updateSupplier(user: AuthenticatedUser, id: string, dto: SupplierDto) { this.allow(user, [SystemRole.OWNER_EXECUTIVE, SystemRole.ADMIN, SystemRole.PROCUREMENT]); await this.supplier(user, id); const item = await this.prisma.supplier.update({ where: { id }, data: { ...dto, rating: dto.rating === undefined ? undefined : this.decimal(dto.rating) } }); await this.audit.record({ companyId: user.companyId, actorId: user.id, action: 'SUPPLIER_UPDATED', entityType: 'Supplier', entityId: id }); return this.serialize(item) }
+
+  async materialRequests(user: AuthenticatedUser, projectId: string, q: ListDto) { await this.project(user, projectId); const requests = await this.prisma.materialRequest.findMany({ where: { companyId: user.companyId, projectId, ...(q.status ? { status: q.status as any } : {}), ...(q.search ? { OR: [{ requestNumber: { contains: q.search, mode: 'insensitive' } }, { purpose: { contains: q.search, mode: 'insensitive' } }] } : {}) }, orderBy: { createdAt: 'desc' }, skip: (q.page - 1) * q.limit, take: q.limit }); const withItems = await Promise.all(requests.map(async (request) => ({ ...request, items: await this.prisma.materialRequestItem.findMany({ where: { materialRequestId: request.id } }) }))); return this.serialize(withItems) }
+  async materialRequest(user: AuthenticatedUser, id: string) { const item = await this.prisma.materialRequest.findFirst({ where: { id, companyId: user.companyId } }); if (!item) throw new NotFoundException('Material request not found'); await this.project(user, item.projectId); const items = await this.prisma.materialRequestItem.findMany({ where: { materialRequestId: id } }); return this.serialize({ ...item, items }) }
+  async createMaterialRequest(user: AuthenticatedUser, projectId: string, dto: MaterialRequestDto) { await this.project(user, projectId); const requestNumber = `MR-${new Date().getFullYear()}-${Date.now().toString().slice(-8)}`; const item = await this.prisma.materialRequest.create({ data: { companyId: user.companyId, projectId, siteId: dto.siteId, requestedById: user.id, requestNumber, requestedForDate: dto.requestedForDate ? new Date(dto.requestedForDate) : undefined, priority: dto.priority, purpose: dto.purpose, notes: dto.notes } }); for (const requestItem of dto.items) await this.prisma.materialRequestItem.create({ data: { materialRequestId: item.id, description: requestItem.description, specification: requestItem.specification, unit: requestItem.unit, requestedQuantity: this.decimal(requestItem.requestedQuantity), costCodeId: requestItem.costCodeId, boqItemId: requestItem.boqItemId, notes: requestItem.notes } }); const items = await this.prisma.materialRequestItem.findMany({ where: { materialRequestId: item.id } }); await this.audit.record({ companyId: user.companyId, actorId: user.id, action: 'MATERIAL_REQUEST_CREATED', entityType: 'MaterialRequest', entityId: item.id }); return this.serialize({ ...item, items }) }
+  async updateMaterialRequest(user: AuthenticatedUser, id: string, dto: MaterialRequestDto) { const current = await this.materialRequest(user, id); if (current.status !== 'DRAFT') throw new ConflictException('Only draft requests can be edited'); return this.prisma.materialRequest.update({ where: { id }, data: { siteId: dto.siteId, requestedForDate: dto.requestedForDate ? new Date(dto.requestedForDate) : undefined, priority: dto.priority, purpose: dto.purpose, notes: dto.notes } }) }
+  async submitMaterialRequest(user: AuthenticatedUser, id: string) {
+    const current = await this.materialRequest(user, id)
+    if (current.requestedById !== user.id && !['PROJECT_MANAGER', 'ADMIN', 'OWNER_EXECUTIVE'].includes(user.role)) throw new ForbiddenException('Cannot submit this request')
+    if (current.status !== 'DRAFT') throw new ConflictException('Only draft requests can be submitted')
+    const updated = await this.prisma.$transaction(async (tx) => {
+      const existingApproval = await tx.approvalInstance.findFirst({ where: { companyId: user.companyId, entityType: 'MaterialRequest', entityId: id, status: 'PENDING' } })
+      if (existingApproval) throw new ConflictException('Material request already has a pending approval')
+      const workflow = await tx.approvalWorkflow.upsert({ where: { companyId_entityType_name: { companyId: user.companyId, entityType: 'MaterialRequest', name: 'Project Manager Approval' } }, update: {}, create: { companyId: user.companyId, entityType: 'MaterialRequest', name: 'Project Manager Approval' } })
+      const step = await tx.approvalStep.upsert({ where: { workflowId_stepNumber: { workflowId: workflow.id, stepNumber: 1 } }, update: {}, create: { workflowId: workflow.id, stepNumber: 1, role: 'PROJECT_MANAGER', name: 'Project Manager approval' } })
+      const request = await tx.materialRequest.update({ where: { id }, data: { status: 'PENDING_APPROVAL', submittedAt: new Date() } })
+      await tx.approvalInstance.create({ data: { companyId: user.companyId, projectId: current.projectId, entityType: 'MaterialRequest', entityId: id, workflowId: workflow.id, currentStepId: step.id } })
+      await tx.auditEvent.create({ data: { companyId: user.companyId, actorId: user.id, action: 'MATERIAL_REQUEST_SUBMITTED', entityType: 'MaterialRequest', entityId: id } })
+      return request
+    })
+    return this.serialize(updated)
+  }
+
+  async approvals(user: AuthenticatedUser, q: ListDto) { const projectIds = companyWide.includes(user.role) ? undefined : (await this.prisma.projectMember.findMany({ where: { userId: user.id }, select: { projectId: true } })).map((x) => x.projectId); return this.serialize(await this.prisma.approvalInstance.findMany({ where: { companyId: user.companyId, ...(projectIds ? { projectId: { in: projectIds } } : {}), ...(q.status ? { status: q.status as any } : {}) }, orderBy: { createdAt: 'desc' }, skip: (q.page - 1) * q.limit, take: q.limit })) }
+  async approval(user: AuthenticatedUser, id: string) { const instance = await this.prisma.approvalInstance.findFirst({ where: { id, companyId: user.companyId } }); if (!instance) throw new NotFoundException('Approval not found'); if (instance.projectId) await this.project(user, instance.projectId); const [step, actions] = await Promise.all([instance.currentStepId ? this.prisma.approvalStep.findUnique({ where: { id: instance.currentStepId } }) : null, this.prisma.approvalAction.findMany({ where: { instanceId: id }, orderBy: { createdAt: 'asc' } })]); return this.serialize({ ...instance, currentStep: step, actions }) }
+  async decision(user: AuthenticatedUser, id: string, dto: DecisionDto) {
+    const instance = await this.prisma.approvalInstance.findFirst({ where: { id, companyId: user.companyId } })
+    if (!instance) throw new NotFoundException('Approval not found')
+    if (instance.projectId) await this.project(user, instance.projectId)
+    if (!dto.decision) throw new ConflictException('Approval decision is required')
+    const result = await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.approvalInstance.findFirst({ where: { id, companyId: user.companyId } })
+      if (!locked || locked.status !== ApprovalStatus.PENDING) throw new ConflictException('Approval is already decided')
+      const step = locked.currentStepId ? await tx.approvalStep.findUnique({ where: { id: locked.currentStepId } }) : null
+      if (!step) throw new ConflictException('Approval step is not configured')
+      if (user.role !== step.role && !companyWide.includes(user.role)) throw new ForbiddenException('Approval is not permitted for the current step')
+      const decision = dto.decision!
+      const status = decision === ApprovalDecision.APPROVE ? ApprovalStatus.APPROVED : decision === ApprovalDecision.REJECT ? ApprovalStatus.REJECTED : ApprovalStatus.RETURNED
+      const action = await tx.approvalAction.create({ data: { companyId: user.companyId, projectId: locked.projectId, instanceId: id, stepId: step.id, actorId: user.id, actorRole: user.role, decision, comment: dto.comment } })
+      const nextStep = decision === ApprovalDecision.APPROVE ? await tx.approvalStep.findFirst({ where: { workflowId: locked.workflowId, stepNumber: { gt: step.stepNumber } }, orderBy: { stepNumber: 'asc' } }) : null
+      if (nextStep) await tx.approvalInstance.update({ where: { id }, data: { currentStepId: nextStep.id } })
+      else await tx.approvalInstance.update({ where: { id }, data: { status } })
+      if (!nextStep && locked.entityType === 'MaterialRequest') await tx.materialRequest.update({ where: { id: locked.entityId }, data: { status: status === ApprovalStatus.APPROVED ? MaterialRequestStatus.APPROVED : status === ApprovalStatus.REJECTED ? MaterialRequestStatus.REJECTED : MaterialRequestStatus.DRAFT } })
+      if (!nextStep && locked.entityType === 'PurchaseOrder') await tx.purchaseOrder.update({ where: { id: locked.entityId }, data: { status: status === ApprovalStatus.APPROVED ? 'APPROVED' : status === ApprovalStatus.REJECTED ? 'CANCELLED' : 'DRAFT', approvedAt: status === ApprovalStatus.APPROVED ? new Date() : undefined } })
+      if (!nextStep && locked.entityType === 'Expense') await tx.expense.update({ where: { id: locked.entityId }, data: { status: status === ApprovalStatus.APPROVED ? 'APPROVED' : status === ApprovalStatus.REJECTED ? 'REJECTED' : 'DRAFT' } })
+      await tx.auditEvent.create({ data: { companyId: user.companyId, actorId: user.id, action: `APPROVAL_${decision}`, entityType: locked.entityType, entityId: locked.entityId, metadata: { step: step.stepNumber, nextStepId: nextStep?.id } } })
+      return { action, nextStepId: nextStep?.id ?? null, workflowComplete: !nextStep }
+    })
+    return this.serialize(result)
+  }
+}
